@@ -113,14 +113,18 @@ namespace Trino.Odbc
                 _httpClient.DefaultRequestHeaders.Add("User-Agent", "Trino ODBC Driver .NET");
                 _httpClient.DefaultRequestHeaders.Add("X-Trino-User", _connectionStringBuilder.User);
                 
-                if (!string.IsNullOrEmpty(_connectionStringBuilder.Password))
+                // Add Basic Auth only if both username and password are provided and not empty
+                if (!string.IsNullOrEmpty(_connectionStringBuilder.User) && 
+                    !string.IsNullOrEmpty(_connectionStringBuilder.Password))
                 {
-                    string authValue = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_connectionStringBuilder.User}:{_connectionStringBuilder.Password}"));
+                    string authValue = Convert.ToBase64String(
+                        Encoding.UTF8.GetBytes($"{_connectionStringBuilder.User}:{_connectionStringBuilder.Password}"));
                     _httpClient.DefaultRequestHeaders.Add("Authorization", $"Basic {authValue}");
                 }
 
                 // Test connection with a simple query
-                var baseUri = new Uri($"{_connectionStringBuilder.Server.TrimEnd('/')}/v1/statement");
+                string protocol = _connectionStringBuilder.UseSSL ? "https" : "http";
+                var baseUri = new Uri($"{protocol}://{_connectionStringBuilder.Host}:{_connectionStringBuilder.Port}/v1/statement");
                 var content = new StringContent("SELECT 1", Encoding.UTF8, "application/json");
                 var response = _httpClient.PostAsync(baseUri, content).Result;
                 
@@ -172,10 +176,22 @@ namespace Trino.Odbc
             ConnectionString = connectionString;
         }
 
-        public string Server
+        public string Host
         {
-            get => TryGetValue("Server", out object value) ? (string)value : "http://localhost:8080";
-            set => this["Server"] = value;
+            get => TryGetValue("Host", out object value) ? (string)value : "localhost";
+            set => this["Host"] = value;
+        }
+
+        public int Port
+        {
+            get => TryGetValue("Port", out object value) && int.TryParse(value.ToString(), out int result) ? result : 8080;
+            set => this["Port"] = value;
+        }
+
+        public bool UseSSL
+        {
+            get => TryGetValue("UseSSL", out object value) && bool.TryParse(value.ToString(), out bool result) && result;
+            set => this["UseSSL"] = value;
         }
 
         public string Catalog
@@ -206,6 +222,34 @@ namespace Trino.Odbc
         {
             get => TryGetValue("Timeout", out object value) && int.TryParse(value.ToString(), out int result) ? result : 30;
             set => this["Timeout"] = value;
+        }
+
+        // For backward compatibility
+        public string Server
+        {
+            get
+            {
+                string protocol = UseSSL ? "https" : "http";
+                return $"{protocol}://{Host}:{Port}";
+            }
+            set
+            {
+                if (string.IsNullOrEmpty(value))
+                    return;
+
+                try
+                {
+                    var uri = new Uri(value);
+                    UseSSL = uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase);
+                    Host = uri.Host;
+                    Port = uri.Port;
+                }
+                catch
+                {
+                    // If unable to parse as URI, use as-is for Host
+                    Host = value;
+                }
+            }
         }
     }
 
@@ -356,7 +400,8 @@ namespace Trino.Odbc
                     }
 
                     // Execute the query
-                    var baseUri = new Uri($"{connectionBuilder.Server.TrimEnd('/')}/v1/statement");
+                    string protocol = connectionBuilder.UseSSL ? "https" : "http";
+                    var baseUri = new Uri($"{protocol}://{connectionBuilder.Host}:{connectionBuilder.Port}/v1/statement");
                     var content = new StringContent(sql, Encoding.UTF8, "application/json");
                     var response = httpClient.PostAsync(baseUri, content).Result;
 
@@ -487,9 +532,9 @@ namespace Trino.Odbc
     }
 
     /// <summary>
-    /// Command class for Trino.
+    /// Extended methods for the TrinoCommand class.
     /// </summary>
-    public class TrinoCommand : DbCommand
+    public partial class TrinoCommand
     {
         public TrinoCommand() { }
 
@@ -829,73 +874,167 @@ namespace Trino.Odbc
 
         private void ProcessResponseData(string responseJson)
         {
-            _currentResult = JsonDocument.Parse(responseJson);
-            var root = _currentResult.RootElement;
-
-            // Extract next URI if available
-            if (root.TryGetProperty("nextUri", out JsonElement nextUriElement))
+            try
             {
-                _nextUri = nextUriElement.GetString();
-            }
-            else
-            {
-                _nextUri = null;
-            }
+                Console.WriteLine($"DEBUG: Processing response: {responseJson.Substring(0, Math.Min(responseJson.Length, 200))}...");
+                
+                _currentResult = JsonDocument.Parse(responseJson);
+                var root = _currentResult.RootElement;
 
-            // Extract column information if available
-            if (root.TryGetProperty("columns", out JsonElement columnsElement) && columnsElement.ValueKind == JsonValueKind.Array)
-            {
-                int columnCount = columnsElement.GetArrayLength();
-                _columnNames = new string[columnCount];
-                _columnTypes = new string[columnCount];
-                _columnMapping = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-
-                for (int i = 0; i < columnCount; i++)
+                // Extract next URI if available
+                if (root.TryGetProperty("nextUri", out JsonElement nextUriElement) && 
+                    nextUriElement.ValueKind != JsonValueKind.Null)
                 {
-                    var column = columnsElement[i];
-                    string name = column.GetProperty("name").GetString();
-                    string type = column.GetProperty("type").GetString();
+                    _nextUri = nextUriElement.GetString();
+                    Console.WriteLine($"DEBUG: Next URI found: {_nextUri}");
+                }
+                else
+                {
+                    _nextUri = null;
+                    Console.WriteLine("DEBUG: No next URI found");
+                }
+
+                // Extract column information if available
+                if (root.TryGetProperty("columns", out JsonElement columnsElement) && 
+                    columnsElement.ValueKind == JsonValueKind.Array)
+                {
+                    int columnCount = columnsElement.GetArrayLength();
+                    _columnNames = new string[columnCount];
+                    _columnTypes = new string[columnCount];
+                    _columnMapping = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+                    Console.WriteLine($"DEBUG: Found {columnCount} columns");
+
+                    for (int i = 0; i < columnCount; i++)
+                    {
+                        var column = columnsElement[i];
+                        string name = column.GetProperty("name").GetString();
+                        string type = column.GetProperty("type").GetString();
+                        
+                        _columnNames[i] = name;
+                        _columnTypes[i] = type;
+                        _columnMapping[name] = i;
+                        
+                        Console.WriteLine($"DEBUG: Column {i}: {name} ({type})");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("DEBUG: No columns found in response");
                     
-                    _columnNames[i] = name;
-                    _columnTypes[i] = type;
-                    _columnMapping[name] = i;
+                    // Initialize empty columns if not found
+                    if (_columnNames == null)
+                    {
+                        _columnNames = new string[0];
+                        _columnTypes = new string[0];
+                        _columnMapping = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    }
+                }
+
+                // Extract data rows if available
+                if (root.TryGetProperty("data", out JsonElement dataElement) && 
+                    dataElement.ValueKind == JsonValueKind.Array)
+                {
+                    int rowCount = dataElement.GetArrayLength();
+                    _hasRows = rowCount > 0;
+                    _rowsEnumerator = dataElement.EnumerateArray();
+                    _currentRow = -1;
+                    
+                    Console.WriteLine($"DEBUG: Found {rowCount} rows of data");
+                }
+                else
+                {
+                    Console.WriteLine("DEBUG: No data rows found in response");
+                    _hasRows = false;
+                }
+                
+                // Check if there's an error message
+                if (root.TryGetProperty("error", out JsonElement errorElement))
+                {
+                    string errorType = errorElement.TryGetProperty("errorType", out JsonElement errorTypeElement) 
+                        ? errorTypeElement.GetString() : "Unknown";
+                    string errorMessage = errorElement.TryGetProperty("message", out JsonElement messageElement)
+                        ? messageElement.GetString() : "Unknown error";
+                        
+                    Console.WriteLine($"DEBUG: Error found in response: {errorType} - {errorMessage}");
+                    throw new Exception($"Trino error: {errorType} - {errorMessage}");
+                }
+                
+                // Handle the case where Trino returns a response with stats but no data yet
+                if (!_hasRows && string.IsNullOrEmpty(_nextUri) && 
+                    !root.TryGetProperty("error", out _) && 
+                    root.TryGetProperty("stats", out _))
+                {
+                    Console.WriteLine("DEBUG: Query completed successfully but returned no rows");
                 }
             }
-
-            // Extract data rows if available
-            if (root.TryGetProperty("data", out JsonElement dataElement) && dataElement.ValueKind == JsonValueKind.Array)
+            catch (Exception ex)
             {
-                _hasRows = dataElement.GetArrayLength() > 0;
-                _rowsEnumerator = dataElement.EnumerateArray();
-                _currentRow = -1;
-            }
-            else
-            {
-                _hasRows = false;
+                Console.WriteLine($"DEBUG: Error processing response: {ex.Message}");
+                throw;
             }
         }
 
         private void FetchNextBatch()
         {
             if (string.IsNullOrEmpty(_nextUri))
+            {
+                Console.WriteLine("DEBUG: FetchNextBatch called but nextUri is empty");
                 return;
-
-            try
-            {
-                // Make a GET request to the next URI
-                var response = _httpClient.GetAsync(new Uri(_nextUri)).Result;
-                
-                if (!response.IsSuccessStatusCode)
-                {
-                    throw new DbException($"Failed to fetch next batch: {response.StatusCode}");
-                }
-
-                var responseContent = response.Content.ReadAsStringAsync().Result;
-                ProcessResponseData(responseContent);
             }
-            catch (Exception ex)
+
+            Console.WriteLine($"DEBUG: Fetching next batch from: {_nextUri}");
+            int retryCount = 0;
+            const int maxRetries = 3;
+            TimeSpan retryDelay = TimeSpan.FromMilliseconds(100);
+
+            while (retryCount < maxRetries)
             {
-                throw new DbException($"Error fetching next batch: {ex.Message}", ex);
+                try
+                {
+                    // Make a GET request to the next URI
+                    var response = _httpClient.GetAsync(new Uri(_nextUri)).Result;
+                    Console.WriteLine($"DEBUG: Got response with status: {response.StatusCode}");
+                    
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        if ((int)response.StatusCode >= 500 && retryCount < maxRetries - 1)
+                        {
+                            // Server error, retry after a delay
+                            retryCount++;
+                            Console.WriteLine($"DEBUG: Server error {response.StatusCode}, retry {retryCount}/{maxRetries} after {retryDelay.TotalMilliseconds}ms");
+                            Thread.Sleep(retryDelay);
+                            retryDelay = TimeSpan.FromMilliseconds(retryDelay.TotalMilliseconds * 2); // Exponential backoff
+                            continue;
+                        }
+                        
+                        string responseContent = response.Content.ReadAsStringAsync().Result;
+                        Console.WriteLine($"DEBUG: Error response content: {responseContent}");
+                        throw new DbException($"Failed to fetch next batch: {response.StatusCode} - {responseContent}");
+                    }
+
+                    var responseContent = response.Content.ReadAsStringAsync().Result;
+                    ProcessResponseData(responseContent);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    if (ex is DbException)
+                        throw;
+                        
+                    if (retryCount < maxRetries - 1)
+                    {
+                        retryCount++;
+                        Console.WriteLine($"DEBUG: Error fetching batch, retry {retryCount}/{maxRetries}: {ex.Message}");
+                        Thread.Sleep(retryDelay);
+                        retryDelay = TimeSpan.FromMilliseconds(retryDelay.TotalMilliseconds * 2); // Exponential backoff
+                    }
+                    else
+                    {
+                        Console.WriteLine($"DEBUG: Max retries reached, throwing exception: {ex.Message}");
+                        throw new DbException($"Error fetching next batch after {maxRetries} attempts: {ex.Message}", ex);
+                    }
+                }
             }
         }
 
@@ -904,7 +1043,24 @@ namespace Trino.Odbc
             if (_closed)
                 throw new InvalidOperationException("DataReader is closed");
 
-            bool hasNext = _rowsEnumerator.MoveNext();
+            // If we don't have an enumerator yet, return false
+            if (_rowsEnumerator.Equals(default(JsonElement.ArrayEnumerator)))
+            {
+                Console.WriteLine("DEBUG: Read called but no row enumerator is available");
+                return false;
+            }
+
+            bool hasNext = false;
+            try 
+            {
+                hasNext = _rowsEnumerator.MoveNext();
+                Console.WriteLine($"DEBUG: Read attempt - has next row: {hasNext}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"DEBUG: Error moving to next row: {ex.Message}");
+                return false;
+            }
             
             if (hasNext)
             {
@@ -913,11 +1069,13 @@ namespace Trino.Odbc
             }
             else if (!string.IsNullOrEmpty(_nextUri))
             {
+                Console.WriteLine("DEBUG: No more rows in current batch, fetching next batch");
                 // Fetch the next batch of data
                 FetchNextBatch();
                 return Read(); // Recursive call to attempt reading from the new batch
             }
             
+            Console.WriteLine("DEBUG: No more rows and no next URI");
             return false;
         }
 
