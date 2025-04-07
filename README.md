@@ -41,7 +41,9 @@ using Trino.Odbc;
 
 // Create a connection
 string connectionString = 
-    "Server=http://your-trino-server:8080;" +
+    "Host=your-trino-server;" +
+    "Port=8080;" +
+    "UseSSL=false;" +
     "Catalog=hive;" +
     "Schema=default;" +
     "User=trino;" +
@@ -149,18 +151,63 @@ using (var command = new TrinoCommand(sql, connection))
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| Server    | Trino server URL including protocol (http/https) and port | http://localhost:8080 |
+| Host      | Trino server hostname or IP address | localhost |
+| Port      | Trino server port | 8080 |
+| UseSSL    | Whether to use HTTPS instead of HTTP | false |
 | Catalog   | Trino catalog to use | (empty) |
 | Schema    | Schema within the catalog | (empty) |
 | User      | Username for authentication | anonymous |
 | Password  | Password for authentication | (empty) |
 | Timeout   | Connection timeout in seconds | 30 |
 
+> **Note:** For backward compatibility, you can also use `Server=http://hostname:port` instead of separate Host/Port/UseSSL parameters.
+
 ## Limitations
 
 - Trino doesn't support traditional ACID transactions, so the transaction methods are implemented as no-ops
 - Limited support for prepared statements since Trino handles them differently than traditional databases
 - The driver implements parameter substitution client-side
+
+## Troubleshooting
+
+If you encounter issues with the Trino ODBC driver, consider these common solutions:
+
+### Connection Issues
+
+1. **Can't connect to server**:
+   - Verify that the host and port are correct
+   - Check if SSL is required (UseSSL=true)
+   - Make sure there's network connectivity to the Trino server
+   - Try connecting with a browser to the Trino UI (usually at http://host:port)
+
+2. **Authentication failures**:
+   - Verify username and password
+   - Check if the Trino server requires authentication
+   - For Kerberos or other authentication methods, additional configuration may be needed
+
+3. **Cannot find catalog/schema**:
+   - Verify that the catalog and schema exist on the Trino server
+   - Check if the user has permission to access the specified catalog/schema
+
+### Query Issues
+
+1. **No data returning**:
+   - Try a simple query like `SELECT 1 AS test` to test connectivity
+   - Use the included troubleshooting utility to test direct HTTP access to the Trino REST API
+   - Check if there are any error messages in the Trino server logs
+
+2. **Performance issues**:
+   - Consider using smaller result sets with LIMIT clauses
+   - Check if the Trino server is under heavy load
+   - Optimize your queries to use appropriate filters
+
+3. **Error handling**:
+   - Use try/catch blocks to capture detailed error information
+   - Enable debugging by adding console output in the ProcessResponseData method
+
+### Enabling Debug Output
+
+To enable additional debug output for troubleshooting, uncomment the debug Console.WriteLine lines in the driver source code.
 
 ## Performance Considerations
 
