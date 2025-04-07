@@ -14,7 +14,9 @@ namespace TrinoOdbcExample
             {
                 // Connection string format
                 string connectionString = 
-                    "Server=http://localhost:8080;" +
+                    "Host=localhost;" +
+                    "Port=8080;" +
+                    "UseSSL=false;" +
                     "Catalog=tpch;" +
                     "Schema=tiny;" +
                     "User=trino;" +
