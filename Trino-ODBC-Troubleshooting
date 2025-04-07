@@ -1,0 +1,263 @@
+using System;
+using System.Data;
+using System.Text.Json;
+using System.Net.Http;
+using Trino.Odbc;
+
+namespace TrinoOdbcTroubleshooting
+{
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            Console.WriteLine("Trino ODBC Driver Troubleshooting Utility");
+            Console.WriteLine("=========================================");
+            
+            // Connection parameters
+            string host = "localhost";
+            int port = 8080;
+            bool useSSL = false;
+            string catalog = "tpch";
+            string schema = "tiny";
+            string user = "trino";
+            string password = "";
+            
+            Console.WriteLine("Connection Parameters:");
+            Console.WriteLine($"Host: {host}");
+            Console.WriteLine($"Port: {port}");
+            Console.WriteLine($"UseSSL: {useSSL}");
+            Console.WriteLine($"Catalog: {catalog}");
+            Console.WriteLine($"Schema: {schema}");
+            Console.WriteLine($"User: {user}");
+            Console.WriteLine($"Password: {(string.IsNullOrEmpty(password) ? "(empty)" : "****")}");
+            Console.WriteLine();
+            
+            // Test direct HTTP connection first
+            TestDirectHttpConnection(host, port, useSSL, catalog, schema, user, password);
+            
+            // Now test the ODBC driver
+            TestOdbcConnection(host, port, useSSL, catalog, schema, user, password);
+            
+            Console.WriteLine("\nPress any key to exit...");
+            Console.ReadKey();
+        }
+        
+        static void TestDirectHttpConnection(string host, int port, bool useSSL, string catalog, string schema, string user, string password)
+        {
+            Console.WriteLine("Testing direct HTTP connection to Trino server...");
+            
+            try
+            {
+                string protocol = useSSL ? "https" : "http";
+                string baseUrl = $"{protocol}://{host}:{port}";
+                string testQuery = "SELECT 1 AS test";
+                
+                using (var httpClient = new HttpClient())
+                {
+                    httpClient.Timeout = TimeSpan.FromSeconds(30);
+                    
+                    // Set headers
+                    httpClient.DefaultRequestHeaders.Add("User-Agent", "Trino Test Client");
+                    httpClient.DefaultRequestHeaders.Add("X-Trino-User", user);
+                    
+                    if (!string.IsNullOrEmpty(catalog))
+                    {
+                        httpClient.DefaultRequestHeaders.Add("X-Trino-Catalog", catalog);
+                    }
+                    
+                    if (!string.IsNullOrEmpty(schema))
+                    {
+                        httpClient.DefaultRequestHeaders.Add("X-Trino-Schema", schema);
+                    }
+                    
+                    if (!string.IsNullOrEmpty(user) && !string.IsNullOrEmpty(password))
+                    {
+                        string authValue = Convert.ToBase64String(
+                            System.Text.Encoding.UTF8.GetBytes($"{user}:{password}"));
+                        httpClient.DefaultRequestHeaders.Add("Authorization", $"Basic {authValue}");
+                    }
+                    
+                    Console.WriteLine($"Connecting to: {baseUrl}/v1/statement");
+                    
+                    // Execute query
+                    var content = new StringContent(testQuery, System.Text.Encoding.UTF8, "application/json");
+                    var response = httpClient.PostAsync($"{baseUrl}/v1/statement", content).Result;
+                    
+                    Console.WriteLine($"Response status: {response.StatusCode}");
+                    
+                    if (response.IsSuccessStatusCode)
+                    {
+                        string responseContent = response.Content.ReadAsStringAsync().Result;
+                        Console.WriteLine("Response content:");
+                        Console.WriteLine(responseContent);
+                        
+                        // Parse JSON response
+                        using (JsonDocument document = JsonDocument.Parse(responseContent))
+                        {
+                            JsonElement root = document.RootElement;
+                            
+                            // Check for error
+                            if (root.TryGetProperty("error", out JsonElement errorElement))
+                            {
+                                string errorType = errorElement.GetProperty("errorType").GetString();
+                                string errorMessage = errorElement.GetProperty("message").GetString();
+                                Console.WriteLine($"Error: {errorType} - {errorMessage}");
+                            }
+                            else
+                            {
+                                Console.WriteLine("Direct HTTP connection successful!");
+                                
+                                // Check for next URI and data
+                                bool hasNextUri = root.TryGetProperty("nextUri", out JsonElement nextUriElement) && 
+                                                 nextUriElement.ValueKind != JsonValueKind.Null;
+                                bool hasData = root.TryGetProperty("data", out JsonElement dataElement) && 
+                                              dataElement.ValueKind == JsonValueKind.Array;
+                                bool hasColumns = root.TryGetProperty("columns", out JsonElement columnsElement) &&
+                                           columnsElement.ValueKind == JsonValueKind.Array;
+                                
+                                Console.WriteLine($"Response has nextUri: {hasNextUri}");
+                                Console.WriteLine($"Response has data: {hasData}");
+                                Console.WriteLine($"Response has columns: {hasColumns}");
+                                
+                                if (hasData)
+                                {
+                                    Console.WriteLine("\nData:");
+                                    foreach (JsonElement row in dataElement.EnumerateArray())
+                                    {
+                                        foreach (JsonElement cell in row.EnumerateArray())
+                                        {
+                                            Console.Write($"{cell.ToString()}\t");
+                                        }
+                                        Console.WriteLine();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        string errorContent = response.Content.ReadAsStringAsync().Result;
+                        Console.WriteLine($"Error content: {errorContent}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in direct HTTP connection: {ex.Message}");
+                if (ex.InnerException != null)
+                {
+                    Console.WriteLine($"Inner exception: {ex.InnerException.Message}");
+                }
+            }
+            
+            Console.WriteLine();
+        }
+        
+        static void TestOdbcConnection(string host, int port, bool useSSL, string catalog, string schema, string user, string password)
+        {
+            Console.WriteLine("Testing Trino ODBC Driver connection...");
+            
+            try
+            {
+                string connectionString = 
+                    $"Host={host};" +
+                    $"Port={port};" +
+                    $"UseSSL={useSSL};" +
+                    $"Catalog={catalog};" +
+                    $"Schema={schema};" +
+                    $"User={user};" +
+                    $"Password={password};";
+                
+                Console.WriteLine($"Connection string: {connectionString}");
+                
+                using (var connection = new TrinoConnection(connectionString))
+                {
+                    Console.WriteLine("Opening connection...");
+                    connection.Open();
+                    Console.WriteLine("Connection opened successfully!");
+                    
+                    // Test simple query
+                    string sql = "SELECT 1 AS test";
+                    Console.WriteLine($"\nExecuting query: {sql}");
+                    
+                    using (var command = new TrinoCommand(sql, connection))
+                    {
+                        using (var reader = command.ExecuteReader())
+                        {
+                            // Display column names
+                            Console.WriteLine("\nColumns:");
+                            for (int i = 0; i < reader.FieldCount; i++)
+                            {
+                                Console.Write($"{reader.GetName(i)}\t");
+                            }
+                            Console.WriteLine();
+                            
+                            // Display data
+                            Console.WriteLine("\nRows:");
+                            int rowCount = 0;
+                            while (reader.Read())
+                            {
+                                rowCount++;
+                                for (int i = 0; i < reader.FieldCount; i++)
+                                {
+                                    Console.Write($"{reader.GetValue(i)}\t");
+                                }
+                                Console.WriteLine();
+                            }
+                            
+                            Console.WriteLine($"\nTotal rows retrieved: {rowCount}");
+                        }
+                    }
+                    
+                    // Test more complex query if the simple one worked
+                    if (catalog == "tpch")
+                    {
+                        string complexSql = "SELECT nationkey, name FROM nation LIMIT 5";
+                        Console.WriteLine($"\nExecuting complex query: {complexSql}");
+                        
+                        using (var command = new TrinoCommand(complexSql, connection))
+                        {
+                            using (var reader = command.ExecuteReader())
+                            {
+                                // Display column names
+                                Console.WriteLine("\nColumns:");
+                                for (int i = 0; i < reader.FieldCount; i++)
+                                {
+                                    Console.Write($"{reader.GetName(i)}\t");
+                                }
+                                Console.WriteLine();
+                                
+                                // Display data
+                                Console.WriteLine("\nRows:");
+                                int rowCount = 0;
+                                while (reader.Read())
+                                {
+                                    rowCount++;
+                                    for (int i = 0; i < reader.FieldCount; i++)
+                                    {
+                                        Console.Write($"{reader.GetValue(i)}\t");
+                                    }
+                                    Console.WriteLine();
+                                }
+                                
+                                Console.WriteLine($"\nTotal rows retrieved: {rowCount}");
+                            }
+                        }
+                    }
+                    
+                    Console.WriteLine("\nClosing connection...");
+                    connection.Close();
+                    Console.WriteLine("Connection closed successfully.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in ODBC connection: {ex.Message}");
+                if (ex.InnerException != null)
+                {
+                    Console.WriteLine($"Inner exception: {ex.InnerException.Message}");
+                }
+            }
+        }
+    }
+}
